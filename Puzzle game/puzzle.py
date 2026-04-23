@@ -1,7 +1,4 @@
-# =========================================================
-# ✦ GESTURE PUZZLE (FULL CLEAN SINGLE FILE)
-# OpenCV + MediaPipe + Image Puzzle + Fixed Logic
-# =========================================================
+
 
 import cv2
 import mediapipe as mp
@@ -10,7 +7,6 @@ import time
 import random
 import math
 
-# ---------------- CONFIG ----------------
 GRID = 3
 TILE_SIZE = 140
 GAP = 8
@@ -18,7 +14,7 @@ OFFSET_X, OFFSET_Y = 80, 80
 PINCH_THRESHOLD = 0.05
 SMOOTHING = 0.25
 
-# ---------------- HAND TRACKER ----------------
+
 class HandTracker:
     def __init__(self):
         self.hands = mp.solutions.hands.Hands(
@@ -56,7 +52,7 @@ class HandTracker:
         return dist < PINCH_THRESHOLD
 
 
-# ---------------- PUZZLE ENGINE ----------------
+
 class Puzzle:
     def __init__(self, image):
         self.grid = GRID
@@ -108,8 +104,6 @@ class Puzzle:
             self.swap(idx, self.blank)
 
 
-# ---------------- RENDER ----------------
-class Renderer:
     def draw_puzzle(self, frame, puzzle):
         for i in range(GRID * GRID):
             r, c = i // GRID, i % GRID

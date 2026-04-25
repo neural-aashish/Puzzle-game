@@ -11,7 +11,7 @@ Controls:
 
 Phases: IDLE -> FRAMING -> CAPTURED -> PLAYING -> SOLVED
 """
-
+#--Puzzle Game using Python-----------------------------------------
 import cv2
 import mediapipe as mp
 import numpy as np

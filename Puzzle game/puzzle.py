@@ -1,1041 +1,622 @@
 """
-╔══════════════════════════════════════════════════════════╗
-║        GESTURE PUZZLE — Hand-Controlled Sliding Puzzle    ║
-║        OpenCV + MediaPipe · Minimal Dark Aesthetic        ║
-╚══════════════════════════════════════════════════════════╝
- 
+GESTURE PUZZLE - Hand-Controlled Sliding Puzzle
+OpenCV + MediaPipe
+
 Controls:
-  ✌️  Both hands visible  → Draw capture frame
-  🤏  Pinch (right hand)  → Capture region / Pick+Drop tile
-  ☝️  Index finger        → Move cursor
- 
-Phases:
-  IDLE      → Show camera, detect hands
-  FRAMING   → Rectangle between both hands
-  CAPTURED  → Show puzzle, shuffle animation
-  PLAYING   → Gesture-drag tiles to solve
-  SOLVED    → Win overlay
+  Both hands visible  -> Draw capture frame (stays on camera)
+  Pinch (right hand)  -> Capture region
+  Pinch a tile        -> Pick it up and drag
+  Drop on any tile    -> Swap instantly
+  Both hands (SOLVED) -> Restart
+
+Phases: IDLE -> FRAMING -> CAPTURED -> PLAYING -> SOLVED
 """
- 
+
 import cv2
 import mediapipe as mp
 import numpy as np
 import time
-
 import random
 import math
- 
-# ─────────────────────────────────────────────
-#  CONFIGURATION
-# ─────────────────────────────────────────────
-GRID          = 3          # 3×3 puzzle
-TILE_SIZE     = 150        # px per tile (will be overridden dynamically)
-TILE_GAP      = 8          # gap between tiles
-CORNER_RADIUS = 14         # rounded corners
-PUZZLE_OFFSET = (80, 90)   # top-left of puzzle board (will be overridden)
-SMOOTH_ALPHA  = 0.25       # landmark smoothing (lower = smoother)
-PINCH_THRESH  = 0.055      # normalised distance for pinch
- 
-# Colour palette  ── dark theme ──────────────────
-BG            = (18,  18,  22)
-ACCENT        = (120, 220, 255)   # cyan
-ACCENT2       = (255, 160, 100)   # amber
-TILE_BG       = (38,  40,  50)
-TILE_BORDER   = (65,  70,  90)
-GLOW_COLOR    = (80, 200, 255)
-WIN_COLOR     = (80, 255, 160)
-TEXT_COLOR    = (220, 220, 235)
-DIM_TEXT      = (100, 105, 120)
- 
-FONT          = cv2.FONT_HERSHEY_SIMPLEX
- 
-# ─────────────────────────────────────────────
-#  UTILITIES — drawing helpers
-# ─────────────────────────────────────────────
- 
-def draw_rounded_rect(img, x, y, w, h, r, color, thickness=-1, alpha=1.0):
-    """Draw a filled or outlined rounded rectangle."""
+
+# ── Config ─────────────────────────────────────
+GRID          = 3
+TILE_GAP      = 6
+CORNER_R      = 12
+SMOOTH_ALPHA  = 0.28
+PINCH_THRESH  = 0.050   # lower = need tighter pinch to trigger
+
+# Colours
+ACCENT   = (120, 220, 255)
+ACCENT2  = (255, 160, 100)
+GLOW_C   = (80,  200, 255)
+WIN_C    = (80,  255, 160)
+TEXT_C   = (220, 220, 235)
+DIM_C    = (100, 105, 120)
+FONT     = cv2.FONT_HERSHEY_SIMPLEX
+
+
+# ── Drawing helpers ────────────────────────────
+
+def rrect(img, x, y, w, h, r, color, thick=-1, alpha=1.0):
+    r = max(1, min(r, w//2, h//2))
     if alpha < 1.0:
-        overlay = img.copy()
-        _draw_rounded_rect_on(overlay, x, y, w, h, r, color, thickness)
-        cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+        ov = img.copy()
+        _rr(ov, x, y, w, h, r, color, thick)
+        cv2.addWeighted(ov, alpha, img, 1-alpha, 0, img)
     else:
-        _draw_rounded_rect_on(img, x, y, w, h, r, color, thickness)
- 
-def _draw_rounded_rect_on(img, x, y, w, h, r, color, thickness):
-    r = min(r, w // 2, h // 2)
-    if thickness == -1:
-        cv2.rectangle(img, (x + r, y), (x + w - r, y + h), color, -1)
-        cv2.rectangle(img, (x, y + r), (x + w, y + h - r), color, -1)
-        cv2.circle(img, (x + r,     y + r),     r, color, -1)
-        cv2.circle(img, (x + w - r, y + r),     r, color, -1)
-        cv2.circle(img, (x + r,     y + h - r), r, color, -1)
-        cv2.circle(img, (x + w - r, y + h - r), r, color, -1)
+        _rr(img, x, y, w, h, r, color, thick)
+
+def _rr(img, x, y, w, h, r, color, t):
+    if t == -1:
+        cv2.rectangle(img, (x+r, y),   (x+w-r, y+h),   color, -1)
+        cv2.rectangle(img, (x,   y+r), (x+w,   y+h-r), color, -1)
+        for cx, cy in [(x+r, y+r), (x+w-r, y+r), (x+r, y+h-r), (x+w-r, y+h-r)]:
+            cv2.circle(img, (cx, cy), r, color, -1)
     else:
-        cv2.rectangle(img, (x + r, y), (x + w - r, y), color, thickness)
-        cv2.rectangle(img, (x + r, y + h), (x + w - r, y + h), color, thickness)
-        cv2.rectangle(img, (x, y + r), (x, y + h - r), color, thickness)
-        cv2.rectangle(img, (x + w, y + r), (x + w, y + h - r), color, thickness)
-        cv2.ellipse(img, (x + r,     y + r),     (r, r), 180, 0, 90,  color, thickness)
-        cv2.ellipse(img, (x + w - r, y + r),     (r, r), 270, 0, 90,  color, thickness)
-        cv2.ellipse(img, (x + r,     y + h - r), (r, r), 90,  0, 90,  color, thickness)
-        cv2.ellipse(img, (x + w - r, y + h - r), (r, r), 0,   0, 90,  color, thickness)
- 
-def glow_circle(img, cx, cy, r, color, layers=4):
-    """Draw a soft glowing circle."""
+        cv2.ellipse(img, (x+r,   y+r),   (r,r), 180, 0, 90, color, t)
+        cv2.ellipse(img, (x+w-r, y+r),   (r,r), 270, 0, 90, color, t)
+        cv2.ellipse(img, (x+r,   y+h-r), (r,r), 90,  0, 90, color, t)
+        cv2.ellipse(img, (x+w-r, y+h-r), (r,r), 0,   0, 90, color, t)
+        cv2.line(img, (x+r,   y),   (x+w-r, y),   color, t)
+        cv2.line(img, (x+r,   y+h), (x+w-r, y+h), color, t)
+        cv2.line(img, (x,     y+r), (x,   y+h-r), color, t)
+        cv2.line(img, (x+w,   y+r), (x+w, y+h-r), color, t)
+
+def glow_dot(img, cx, cy, r, color, layers=4):
     for i in range(layers, 0, -1):
-        alpha = 0.08 * i
-        rad   = r + (layers - i + 1) * 4
-        overlay = img.copy()
-        cv2.circle(overlay, (cx, cy), rad, color, -1)
-        cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+        ov = img.copy()
+        cv2.circle(ov, (cx, cy), r+(layers-i+1)*4, color, -1)
+        cv2.addWeighted(ov, 0.07*i, img, 1-0.07*i, 0, img)
     cv2.circle(img, (cx, cy), r, color, -1)
-    cv2.circle(img, (cx, cy), r - 2, (255, 255, 255), 1)
- 
+    cv2.circle(img, (cx, cy), r-2, (255,255,255), 1)
+
+def ttext(img, txt, cx, cy, scale, color, thick=1):
+    (tw, th), _ = cv2.getTextSize(txt, FONT, scale, thick)
+    cv2.putText(img, txt, (cx-tw//2, cy+th//2), FONT, scale, color, thick, cv2.LINE_AA)
+
 def lerp(a, b, t):
-    return a + (b - a) * t
- 
-def lerp_pt(pa, pb, t):
-    return (lerp(pa[0], pb[0], t), lerp(pa[1], pb[1], t))
- 
-def ease_out(t):
-    return 1 - (1 - t) ** 3
- 
-def put_text_centered(img, text, cx, cy, scale, color, thickness=1):
-    (tw, th), _ = cv2.getTextSize(text, FONT, scale, thickness)
-    cv2.putText(img, text, (cx - tw // 2, cy + th // 2), FONT, scale, color, thickness, cv2.LINE_AA)
- 
-# ─────────────────────────────────────────────
-#  HAND TRACKING MODULE
-# ─────────────────────────────────────────────
- 
+    return a + (b-a)*t
+
+
+# ── Hand Tracker ───────────────────────────────
+
 class HandTracker:
     def __init__(self):
-        self.mp_hands = mp.solutions.hands
-        self.hands    = self.mp_hands.Hands(
+        self._mp   = mp.solutions.hands
+        self._h    = self._mp.Hands(
             max_num_hands=2,
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.6
+            min_detection_confidence=0.72,
+            min_tracking_confidence=0.65,
         )
-        # Smoothed landmark positions  {hand_idx: {lm_idx: [x,y]}}
-        self._smooth = {}
- 
-    def process(self, frame_rgb, frame_shape):
-        """Returns list of hand dicts with smoothed landmarks."""
-        h, w = frame_shape[:2]
-        results = self.hands.process(frame_rgb)
-        hands_out = []
- 
-        if not results.multi_hand_landmarks:
-            self._smooth = {}
-            return hands_out
- 
-        for idx, (lm_list, handedness) in enumerate(
-            zip(results.multi_hand_landmarks, results.multi_handedness)
-        ):
-            label = handedness.classification[0].label  # 'Left' / 'Right'
-            if idx not in self._smooth:
-                self._smooth[idx] = {}
- 
+        self._sm = {}
+
+    def process(self, rgb, shape):
+        H, W = shape[:2]
+        res  = self._h.process(rgb)
+        out  = []
+        if not res.multi_hand_landmarks:
+            self._sm = {}
+            return out
+        for idx, (lms, hns) in enumerate(
+                zip(res.multi_hand_landmarks, res.multi_handedness)):
+            label = hns.classification[0].label
+            if idx not in self._sm:
+                self._sm[idx] = {}
             pts = {}
-            for i, lm in enumerate(lm_list.landmark):
-                raw_x = lm.x * w
-                raw_y = lm.y * h
-                if i in self._smooth[idx]:
-                    sx, sy = self._smooth[idx][i]
-                    sx = lerp(sx, raw_x, SMOOTH_ALPHA)
-                    sy = lerp(sy, raw_y, SMOOTH_ALPHA)
+            for i, lm in enumerate(lms.landmark):
+                rx, ry = lm.x*W, lm.y*H
+                if i in self._sm[idx]:
+                    sx, sy = self._sm[idx][i]
+                    sx = lerp(sx, rx, SMOOTH_ALPHA)
+                    sy = lerp(sy, ry, SMOOTH_ALPHA)
                 else:
-                    sx, sy = raw_x, raw_y
-                self._smooth[idx][i] = (sx, sy)
+                    sx, sy = rx, ry
+                self._sm[idx][i] = (sx, sy)
                 pts[i] = (int(sx), int(sy))
- 
-            # Derived metrics
-            thumb_tip  = pts[4]
-            index_tip  = pts[8]
-            pinch_dist = math.dist(
-                (lm_list.landmark[4].x, lm_list.landmark[4].y),
-                (lm_list.landmark[8].x, lm_list.landmark[8].y)
+            pd = math.dist(
+                (lms.landmark[4].x, lms.landmark[4].y),
+                (lms.landmark[8].x, lms.landmark[8].y),
             )
-            is_pinching = pinch_dist < PINCH_THRESH
- 
-            hands_out.append({
-                'label':       label,
-                'pts':         pts,
-                'thumb_tip':   thumb_tip,
-                'index_tip':   index_tip,
-                'pinch_dist':  pinch_dist,
-                'is_pinching': is_pinching,
-                'wrist':       pts[0],
+            out.append({
+                'label':    label,
+                'pts':      pts,
+                'index':    pts[8],
+                'pinching': pd < PINCH_THRESH,
             })
- 
-        return hands_out
- 
-    def draw_landmarks(self, img, hands):
-        """Render glowing fingertips and subtle skeleton."""
+        return out
+
+    def draw(self, img, hands):
         for hand in hands:
             pts = hand['pts']
-            # Skeleton — dim lines
-            connections = self.mp_hands.HAND_CONNECTIONS
-            for a, b in connections:
+            for a, b in self._mp.HAND_CONNECTIONS:
                 if a in pts and b in pts:
-                    cv2.line(img, pts[a], pts[b], (50, 55, 70), 1, cv2.LINE_AA)
-            # Fingertips glow
-            for tip_id in [4, 8, 12, 16, 20]:
-                if tip_id in pts:
-                    color = ACCENT if not hand['is_pinching'] else ACCENT2
-                    glow_circle(img, pts[tip_id][0], pts[tip_id][1], 6, color, layers=3)
- 
-# ─────────────────────────────────────────────
-#  PUZZLE LOGIC MODULE
-# ─────────────────────────────────────────────
- 
+                    cv2.line(img, pts[a], pts[b], (50,55,70), 1, cv2.LINE_AA)
+            for tip in [4, 8, 12, 16, 20]:
+                if tip in pts:
+                    col = ACCENT2 if hand['pinching'] else ACCENT
+                    glow_dot(img, pts[tip][0], pts[tip][1], 6, col, 3)
+
+
+# ── Puzzle ─────────────────────────────────────
+
 class Puzzle:
-    def __init__(self, image, grid=GRID, canvas_size=(1280, 720)):
-        self.grid       = grid
-        self.gap        = TILE_GAP
+    """
+    9 tiles, NO blank.
+    Board is rendered on camera feed at the exact frame_rect the user drew.
+    Drag any tile -> drop on another tile -> they swap.
+    """
 
-        # Dynamically compute tile size to fill ~82% of canvas
-        cw, ch = canvas_size
-        usable  = int(min(cw, ch) * 0.82)
-        self.tile_size = (usable - TILE_GAP * (grid + 1)) // grid
+    def __init__(self, image, frame_rect):
+        x1, y1, x2, y2 = frame_rect
+        self.bx = x1
+        self.by = y1
+        self.bw = x2 - x1
+        self.bh = y2 - y1
+        self.n  = GRID
 
-        # Center puzzle on canvas
-        board_px = grid * (self.tile_size + self.gap) + self.gap
-        ox = (cw - board_px) // 2
-        oy = (ch - board_px) // 2
-        self.offset = (ox, oy)
+        # Tile dimensions that perfectly fill the frame
+        gx = TILE_GAP * (self.n + 1)
+        gy = TILE_GAP * (self.n + 1)
+        self.tw = (self.bw - gx) // self.n
+        self.th = (self.bh - gy) // self.n
 
-        self.tiles      = []
-        self.blank      = None
+        self.tiles    = []
+        self.drag_idx = None
+        self.drag_px  = (0, 0)
+        self.hover_idx = None
+
         self._build(image)
-        self.shuffle()
-        # Animation state
-        self.anim_tiles = {}
-        self.shuffle_anim_done = False
-        self.dragging   = None
-        self.drag_pos   = (0, 0)
-        self.hover_tile = None
-        self._start_shuffle_anim()
- 
+        self._shuffle()
+
+    def _slot_pos(self, slot_idx):
+        """Top-left pixel of a slot (0..8)."""
+        row, col = divmod(slot_idx, self.n)
+        x = self.bx + TILE_GAP + col*(self.tw + TILE_GAP)
+        y = self.by + TILE_GAP + row*(self.th + TILE_GAP)
+        return (x, y)
+
     def _build(self, image):
-        n    = self.grid
-        ts   = self.tile_size
-        img  = cv2.resize(image, (n * ts, n * ts))
-        self.tiles = []
-        for row in range(n):
-            for col in range(n):
-                idx = row * n + col
-                crop = img[row*ts:(row+1)*ts, col*ts:(col+1)*ts].copy()
-                # Carve rounded corners mask
-                mask = np.zeros((ts, ts), dtype=np.uint8)
-                _draw_rounded_rect_on(mask, 0, 0, ts, ts, CORNER_RADIUS, 255, -1)
-                crop_rgba = cv2.cvtColor(crop, cv2.COLOR_BGR2BGRA)
-                crop_rgba[:, :, 3] = mask
-                self.tiles.append({
-                    'img':       crop_rgba,
-                    'correct':   idx,
-                    'current':   idx,
-                    'anim_pos':  self._tile_pixel_pos(row, col),
-                    'target_pos':self._tile_pixel_pos(row, col),
-                })
-        # Last tile = blank
-        self.blank = n * n - 1
-        self.tiles[self.blank]['img'] = None
- 
-    def _tile_pixel_pos(self, row, col):
-        ox, oy = self.offset
-        return (ox + col * (self.tile_size + self.gap),
-                oy + row * (self.tile_size + self.gap))
- 
-    def idx_to_rc(self, idx):
-        return divmod(idx, self.grid)
- 
-    def shuffle(self, moves=80):
-        """Perform random valid moves to shuffle."""
+        n  = self.n
+        tw, th = self.tw, self.th
+        img = cv2.resize(image, (tw*n, th*n))
+        for i in range(n*n):
+            row, col = divmod(i, n)
+            crop = img[row*th:(row+1)*th, col*tw:(col+1)*tw].copy()
+            mask = np.zeros((th, tw), dtype=np.uint8)
+            _rr(mask, 0, 0, tw, th, CORNER_R, 255, -1)
+            rgba = cv2.cvtColor(crop, cv2.COLOR_BGR2BGRA)
+            rgba[:,:,3] = mask
+            sp = list(self._slot_pos(i))
+            self.tiles.append({
+                'img':        rgba,
+                'correct':    i,
+                'slot':       i,
+                'anim_pos':   [self.bx + self.bw//2, self.by - th],  # start offscreen above
+                'target_pos': sp,
+                '_anim_start': time.time() + i*0.04,
+                '_anim_dur':   0.5,
+            })
+
+    def _shuffle(self, moves=150):
+        n = self.n
         for _ in range(moves):
-            neighbors = self._blank_neighbors()
-            swap = random.choice(neighbors)
-            self._swap(swap, self.blank)
- 
-    def _blank_neighbors(self):
-        br, bc = self.idx_to_rc(self.blank)
-        nbrs = []
-        for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
-            r2, c2 = br + dr, bc + dc
-            if 0 <= r2 < self.grid and 0 <= c2 < self.grid:
-                nbrs.append(r2 * self.grid + c2)
-        return nbrs
- 
-    def _swap(self, a, b):
-        self.tiles[a]['current'], self.tiles[b]['current'] = \
-            self.tiles[b]['current'], self.tiles[a]['current']
-        # Physically swap tile data
-        self.tiles[a], self.tiles[b] = self.tiles[b], self.tiles[a]
-        self.blank = b if self.blank == a else a
- 
-    def _start_shuffle_anim(self):
-        """Animate all tiles to their current board positions."""
-        n = self.grid
-        for i in range(n * n):
-            row, col = self.idx_to_rc(i)
-            target = self._tile_pixel_pos(row, col)
-            self.tiles[i]['target_pos'] = target
-            # stagger
-            delay_offset = (i * 0.04)
-            self.tiles[i]['_anim_start'] = time.time() + delay_offset
-            self.tiles[i]['_anim_dur']   = 0.45
- 
+            a = random.randint(0, n*n-1)
+            b = random.randint(0, n*n-1)
+            if a != b:
+                self._do_swap(a, b)
+
+    def _do_swap(self, sa, sb):
+        """Swap the tiles that currently occupy slots sa and sb."""
+        ta = next(t for t in self.tiles if t['slot'] == sa)
+        tb = next(t for t in self.tiles if t['slot'] == sb)
+        ta['slot'] = sb;  ta['target_pos'] = list(self._slot_pos(sb))
+        tb['slot'] = sa;  tb['target_pos'] = list(self._slot_pos(sa))
+
     def update(self, dt):
-        """Advance tile animations."""
         now = time.time()
-        for tile in self.tiles:
-            start = tile.get('_anim_start', 0)
-            dur   = tile.get('_anim_dur', 0.3)
+        for t in self.tiles:
+            start = t.get('_anim_start', 0)
             if now < start:
                 continue
-            t = min((now - start) / dur, 1.0)
-            t = ease_out(t)
-            ax, ay = tile['anim_pos']
-            tx, ty = tile['target_pos']
-            tile['anim_pos'] = (lerp(ax, tx, 0.18), lerp(ay, ty, 0.18))
- 
-    def move_to(self, tile_idx, animate=True):
-        """Slide a tile into blank if adjacent."""
-        if not self._is_adjacent(tile_idx, self.blank):
-            return False
-        blank_target = self.tiles[tile_idx]['target_pos']
-        tile_target  = self.tiles[self.blank]['target_pos']
-        self._swap(tile_idx, self.blank)
-        self.tiles[self.blank]['target_pos']    = blank_target
-        other = tile_idx
-        self.tiles[other]['target_pos'] = tile_target
-        self.tiles[other]['_anim_start'] = time.time()
-        self.tiles[other]['_anim_dur']   = 0.22
-        return True
+            ax, ay = t['anim_pos']
+            tx, ty = t['target_pos']
+            t['anim_pos'] = [lerp(ax, tx, 0.20), lerp(ay, ty, 0.20)]
 
-    def swap_with(self, src_idx, dst_idx):
-        """Swap any two tiles (drag-drop to any slot)."""
-        if src_idx == dst_idx:
-            return False
-        src_target = self.tiles[dst_idx]['target_pos']
-        dst_target = self.tiles[src_idx]['target_pos']
-        self.tiles[src_idx], self.tiles[dst_idx] = self.tiles[dst_idx], self.tiles[src_idx]
-        if self.blank == src_idx:
-            self.blank = dst_idx
-        elif self.blank == dst_idx:
-            self.blank = src_idx
-        self.tiles[src_idx]['target_pos']  = src_target
-        self.tiles[dst_idx]['target_pos']  = dst_target
-        self.tiles[src_idx]['_anim_start'] = time.time()
-        self.tiles[src_idx]['_anim_dur']   = 0.28
-        self.tiles[dst_idx]['_anim_start'] = time.time()
-        self.tiles[dst_idx]['_anim_dur']   = 0.28
-        return True
-
-    def nearest_slot(self, px, py):
-        """Return board slot index nearest to pixel (px, py)."""
-        best_idx, best_dist = None, float('inf')
-        for i in range(self.grid * self.grid):
-            r, c = self.idx_to_rc(i)
-            tx, ty = self._tile_pixel_pos(r, c)
-            cx = tx + self.tile_size // 2
-            cy = ty + self.tile_size // 2
-            d = math.dist((px, py), (cx, cy))
-            if d < best_dist:
-                best_dist, best_idx = d, i
-        return best_idx
- 
-    def _is_adjacent(self, a, b):
-        ar, ac = self.idx_to_rc(a)
-        br, bc = self.idx_to_rc(b)
-        return abs(ar - br) + abs(ac - bc) == 1
- 
-    def is_solved(self):
-        return all(t['correct'] == t['current'] for t in self.tiles)
- 
-    def tile_at_pixel(self, px, py):
-        """Return tile index under pixel (px,py), or None."""
-        n  = self.grid
-        ts = self.tile_size
-        for i, tile in enumerate(self.tiles):
-            if tile['img'] is None:
-                continue
-            ax, ay = tile['anim_pos']
-            if ax <= px <= ax + ts and ay <= py <= ay + ts:
+    def tile_at(self, px, py):
+        """Tile list index under pixel, or None."""
+        for i, t in enumerate(self.tiles):
+            ax, ay = t['anim_pos']
+            if ax <= px <= ax+self.tw and ay <= py <= ay+self.th:
                 return i
         return None
- 
-    def draw(self, canvas, hover_tile=None, drag_idx=None, drag_pos=None, drop_target=None):
-        """Render all tiles onto canvas."""
-        n  = self.grid
-        ts = self.tile_size
 
-        # Board background — exact board size, no extra padding
-        bw = n * (ts + self.gap) + self.gap
-        bh = bw
-        ox, oy = self.offset
-        draw_rounded_rect(canvas, ox - 4, oy - 4, bw + 8, bh + 8,
-                          24, (25, 27, 35), -1, alpha=0.92)
+    def start_drag(self, tile_idx, px, py):
+        self.drag_idx = tile_idx
+        self.drag_px  = (px, py)
 
-        # Draw slot placeholders
-        for i in range(n * n):
-            r, c = self.idx_to_rc(i)
-            sx, sy = self._tile_pixel_pos(r, c)
-            is_drop = (i == drop_target and drag_idx is not None)
-            slot_color = (30, 70, 45) if is_drop else (40, 44, 58)
-            draw_rounded_rect(canvas, sx, sy, ts, ts, CORNER_RADIUS, slot_color, -1)
-            if is_drop:
-                draw_rounded_rect(canvas, sx, sy, ts, ts, CORNER_RADIUS, ACCENT2, thickness=2)
+    def update_drag(self, px, py):
+        self.drag_px = (px, py)
+        h = self.tile_at(px, py)
+        self.hover_idx = h if h != self.drag_idx else None
 
-        # Draw all non-dragged tiles
-        for i, tile in enumerate(self.tiles):
-            if tile['img'] is None:
-                continue
-            if i == drag_idx:
-                continue
-            ax, ay = int(tile['anim_pos'][0]), int(tile['anim_pos'][1])
-            self._blit_tile(canvas, tile, ax, ay, hover=(i == hover_tile), ts=ts)
-
-
-    def _blit_tile(self, canvas, tile, ax, ay, hover=False, ts=TILE_SIZE, scale=1.0):
-        img_rgba = tile['img']
-        h, w = canvas.shape[:2]
- 
-        if scale != 1.0:
-            new_s = int(ts * scale)
-            img_rgba = cv2.resize(img_rgba, (new_s, new_s))
-            offset   = (new_s - ts) // 2
-            ax -= offset
-            ay -= offset
-            ts_draw = new_s
+    def drop(self, px, py):
+        if self.drag_idx is None:
+            return
+        target = self.tile_at(px, py)
+        if target is not None and target != self.drag_idx:
+            ta = self.tiles[self.drag_idx]
+            tb = self.tiles[target]
+            sa, sb = ta['slot'], tb['slot']
+            now = time.time()
+            ta['slot'] = sb;  ta['target_pos'] = list(self._slot_pos(sb))
+            ta['_anim_start'] = now;  ta['_anim_dur'] = 0.16
+            tb['slot'] = sa;  tb['target_pos'] = list(self._slot_pos(sa))
+            tb['_anim_start'] = now;  tb['_anim_dur'] = 0.16
         else:
-            ts_draw = ts
- 
-        # Clamp to canvas
+            # snap back
+            t = self.tiles[self.drag_idx]
+            t['_anim_start'] = time.time(); t['_anim_dur'] = 0.16
+        self.drag_idx  = None
+        self.hover_idx = None
+
+    def is_solved(self):
+        return all(t['slot'] == t['correct'] for t in self.tiles)
+
+    def draw(self, canvas):
+        tw, th = self.tw, self.th
+
+        # Board shadow
+        rrect(canvas, self.bx-2, self.by-2, self.bw+4, self.bh+4,
+              16, (15,17,24), -1, alpha=0.50)
+
+        # Slot outlines
+        for i in range(self.n*self.n):
+            sx, sy = self._slot_pos(i)
+            rrect(canvas, sx, sy, tw, th, CORNER_R, (45,50,65), -1, alpha=0.35)
+
+        # Normal tiles
+        for i, t in enumerate(self.tiles):
+            if i == self.drag_idx:
+                continue
+            ax, ay = int(t['anim_pos'][0]), int(t['anim_pos'][1])
+            is_h   = (i == self.hover_idx)
+            self._blit(canvas, t['img'], ax, ay, tw, th,
+                       highlight=is_h, scale=1.05 if is_h else 1.0)
+
+        # Dragged tile (on top, follows finger)
+        if self.drag_idx is not None:
+            t  = self.tiles[self.drag_idx]
+            dx = int(self.drag_px[0] - tw//2)
+            dy = int(self.drag_px[1] - th//2)
+            rrect(canvas, dx+7, dy+9, tw, th, CORNER_R, (0,0,0), -1, alpha=0.28)
+            self._blit(canvas, t['img'], dx, dy, tw, th,
+                       highlight=True, scale=1.08)
+
+    def _blit(self, canvas, rgba, ax, ay, tw, th, highlight=False, scale=1.0):
+        ch, cw = canvas.shape[:2]
+        if scale != 1.0:
+            nw = int(tw*scale); nh = int(th*scale)
+            rgba = cv2.resize(rgba, (nw, nh))
+            ax -= (nw-tw)//2;  ay -= (nh-th)//2
+            tw, th = nw, nh
+
         x1, y1 = ax, ay
-        x2, y2 = ax + ts_draw, ay + ts_draw
+        x2, y2 = ax+tw, ay+th
         cx1 = max(0, x1); cy1 = max(0, y1)
-        cx2 = min(w, x2); cy2 = min(h, y2)
+        cx2 = min(cw, x2); cy2 = min(ch, y2)
         if cx2 <= cx1 or cy2 <= cy1:
             return
- 
-        sx1 = cx1 - x1; sy1 = cy1 - y1
-        sx2 = sx1 + (cx2 - cx1); sy2 = sy1 + (cy2 - cy1)
- 
-        roi   = canvas[cy1:cy2, cx1:cx2]
-        patch = img_rgba[sy1:sy2, sx1:sx2]
- 
-        alpha_ch = patch[:, :, 3:4].astype(np.float32) / 255.0
-        rgb_src  = patch[:, :, :3].astype(np.float32)
-        rgb_dst  = roi.astype(np.float32)
-        blended  = (alpha_ch * rgb_src + (1 - alpha_ch) * rgb_dst).astype(np.uint8)
-        canvas[cy1:cy2, cx1:cx2] = blended
- 
-        # Hover border
-        if hover:
-            draw_rounded_rect(canvas, cx1, cy1, cx2 - cx1, cy2 - cy1,
-                              CORNER_RADIUS, ACCENT, thickness=2, alpha=0.9)
- 
-# ─────────────────────────────────────────────
-#  GESTURE CONTROLLER
-# ─────────────────────────────────────────────
- 
-class GestureController:
-    """Maps hand data → game actions with debouncing."""
- 
-    def __init__(self):
-        self._pinch_held  = False
-        self._pinch_start = 0
-        self.PINCH_HOLD   = 0.12   # seconds to confirm pinch
- 
-    def get_cursor(self, hands):
-        """Primary cursor = right-hand index tip."""
+        sx1 = cx1-x1; sy1 = cy1-y1
+        patch = rgba[sy1:sy1+(cy2-cy1), sx1:sx1+(cx2-cx1)]
+        roi   = canvas[cy1:cy2, cx1:cx2].astype(np.float32)
+        a     = patch[:,:,3:4].astype(np.float32)/255.0
+        rgb   = patch[:,:,:3].astype(np.float32)
+        canvas[cy1:cy2, cx1:cx2] = (a*rgb + (1-a)*roi).astype(np.uint8)
+
+        if highlight:
+            rrect(canvas, cx1, cy1, cx2-cx1, cy2-cy1,
+                  CORNER_R, ACCENT2, thick=3, alpha=0.95)
+
+
+# ── Gesture helper ─────────────────────────────
+
+class Gesture:
+    def cursor(self, hands):
         for h in hands:
             if h['label'] == 'Right':
-                return h['index_tip']
-        if hands:
-            return hands[-1]['index_tip']
-        return None
- 
-    def get_pinch(self, hands):
-        """Is any hand pinching right now?"""
+                return h['index']
+        return hands[-1]['index'] if hands else None
+
+    def pinch(self, hands):
         for h in hands:
-            if h['label'] == 'Right' and h['is_pinching']:
-                return True, h['index_tip']
+            if h['label'] == 'Right' and h['pinching']:
+                return True, h['index']
         return False, None
- 
-    def get_frame_rect(self, hands, frame_shape):
-        """Return (x1,y1,x2,y2) rectangle between both hands, or None."""
+
+    def frame_rect(self, hands, shape):
         if len(hands) < 2:
             return None
-        h, w = frame_shape[:2]
-        pts = [h_['index_tip'] for h_ in hands]
+        pts = [h['index'] for h in hands]
         x1 = min(pts[0][0], pts[1][0])
         y1 = min(pts[0][1], pts[1][1])
         x2 = max(pts[0][0], pts[1][0])
         y2 = max(pts[0][1], pts[1][1])
-        min_size = 80
-        if (x2 - x1) < min_size or (y2 - y1) < min_size:
+        if (x2-x1) < 70 or (y2-y1) < 70:
             return None
         return (x1, y1, x2, y2)
- 
-# ─────────────────────────────────────────────
-#  OVERLAY / UI RENDERER
-# ─────────────────────────────────────────────
- 
-def draw_frame_rect(canvas, rect, t):
-    """Draw an animated selection rectangle."""
+
+
+# ── UI ─────────────────────────────────────────
+
+def draw_frame_ui(canvas, rect, t):
     x1, y1, x2, y2 = rect
-    pulse = 0.5 + 0.5 * math.sin(t * 4)
- 
-    # Glow layers
+    pulse = 0.5 + 0.5*math.sin(t*4)
     for i in range(4, 0, -1):
-        alpha = 0.05 * i * pulse
-        overlay = canvas.copy()
-        cv2.rectangle(overlay, (x1 - i*3, y1 - i*3), (x2 + i*3, y2 + i*3),
-                      GLOW_COLOR, 2)
-        cv2.addWeighted(overlay, alpha, canvas, 1 - alpha, 0, canvas)
- 
-    # Main border
-    color = tuple(int(c * (0.75 + 0.25 * pulse)) for c in ACCENT)
-    cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
- 
-    # Corner accents
-    length = 20
-    thick  = 3
+        ov = canvas.copy()
+        cv2.rectangle(ov, (x1-i*3, y1-i*3), (x2+i*3, y2+i*3), GLOW_C, 2)
+        cv2.addWeighted(ov, 0.05*i*pulse, canvas, 1-0.05*i*pulse, 0, canvas)
+    col = tuple(int(c*(0.65+0.35*pulse)) for c in ACCENT)
+    cv2.rectangle(canvas, (x1,y1), (x2,y2), col, 2, cv2.LINE_AA)
+    L = 22
     for cx, cy, sx, sy in [(x1,y1,1,1),(x2,y1,-1,1),(x1,y2,1,-1),(x2,y2,-1,-1)]:
-        cv2.line(canvas, (cx, cy), (cx + sx*length, cy), ACCENT2, thick, cv2.LINE_AA)
-        cv2.line(canvas, (cx, cy), (cx, cy + sy*length), ACCENT2, thick, cv2.LINE_AA)
- 
-    # Centre label
-    cx_mid = (x1 + x2) // 2
-    cy_mid = (y1 + y2) // 2
-    put_text_centered(canvas, "PINCH TO CAPTURE", cx_mid, cy_mid,
-                      0.45, ACCENT, 1)
- 
-def draw_flash(canvas, alpha):
-    """White flash effect on capture."""
-    overlay = np.ones_like(canvas, dtype=np.uint8) * 255
-    cv2.addWeighted(overlay, alpha, canvas, 1 - alpha, 0, canvas)
- 
-def draw_hud(canvas, phase, fps, hands_count):
+        cv2.line(canvas, (cx,cy), (cx+sx*L, cy), ACCENT2, 3, cv2.LINE_AA)
+        cv2.line(canvas, (cx,cy), (cx, cy+sy*L), ACCENT2, 3, cv2.LINE_AA)
+    ttext(canvas, "PINCH TO CAPTURE", (x1+x2)//2, (y1+y2)//2, 0.5, ACCENT)
+
+def draw_hud(canvas, phase, fps, n_hands):
     h, w = canvas.shape[:2]
- 
-    # FPS chip
-    fps_text = f"{int(fps)} fps"
-    draw_rounded_rect(canvas, w - 80, 12, 68, 26, 8, (30, 32, 42), -1)
-    cv2.putText(canvas, fps_text, (w - 72, 30), FONT, 0.45,
-                DIM_TEXT, 1, cv2.LINE_AA)
- 
-    # Phase indicator
-    phase_labels = {
-        'IDLE':     ('● IDLE',        DIM_TEXT),
-        'FRAMING':  ('◈ FRAMING',     ACCENT),
-        'CAPTURED': ('✦ PUZZLE READY',ACCENT2),
-        'PLAYING':  ('▶ PLAYING',     WIN_COLOR),
-        'SOLVED':   ('★ SOLVED',      WIN_COLOR),
+    rrect(canvas, w-84, 8, 72, 26, 7, (28,30,40), -1)
+    cv2.putText(canvas, f"{int(fps)} fps", (w-78, 26),
+                FONT, 0.45, DIM_C, 1, cv2.LINE_AA)
+    labels = {
+        'IDLE':     ('IDLE',     DIM_C),
+        'FRAMING':  ('FRAMING',  ACCENT),
+        'CAPTURED': ('READY',    ACCENT2),
+        'PLAYING':  ('PLAYING',  WIN_C),
+        'SOLVED':   ('SOLVED',   WIN_C),
     }
-    label, color = phase_labels.get(phase, ('', TEXT_COLOR))
-    cv2.putText(canvas, label, (16, 34), FONT, 0.55, color, 1, cv2.LINE_AA)
- 
-    # Hand count dots
+    lbl, col = labels.get(phase, ('', TEXT_C))
+    cv2.putText(canvas, lbl, (14, 30), FONT, 0.55, col, 1, cv2.LINE_AA)
     for i in range(2):
-        col = ACCENT if i < hands_count else (45, 48, 60)
-        cv2.circle(canvas, (16 + i * 18, 52), 5, col, -1, cv2.LINE_AA)
- 
+        cv2.circle(canvas, (14+i*18, 48), 5,
+                   ACCENT if i < n_hands else (40,44,58), -1, cv2.LINE_AA)
+
 def draw_instructions(canvas, phase):
     h, w = canvas.shape[:2]
-    lines = {
-        'IDLE':     ["Raise both hands", "to start framing"],
-        'FRAMING':  ["🤏 Pinch to capture"],
-        'CAPTURED': ["Puzzle loading…"],
-        'PLAYING':  ["☝️  Cursor  |  🤏 Pick & Drop"],
-        'SOLVED':   ["🎉 Puzzle Complete!"],
-    }
-    msgs = lines.get(phase, [])
-    y_base = h - 20 - len(msgs) * 24
-    for i, msg in enumerate(msgs):
-        put_text_centered(canvas, msg, w // 2, y_base + i * 24,
-                          0.50, DIM_TEXT, 1)
- 
-def draw_solved_overlay(canvas, t, solve_time=0.0):
+    msgs = {
+        'IDLE':     ["Raise both hands to start framing"],
+        'FRAMING':  ["Pinch to capture puzzle"],
+        'CAPTURED': ["Loading..."],
+        'PLAYING':  ["Pinch tile, drag to another tile, release to swap"],
+        'SOLVED':   ["Raise both hands to restart"],
+    }.get(phase, [])
+    yb = h - 14 - len(msgs)*22
+    for i, m in enumerate(msgs):
+        ttext(canvas, m, w//2, yb+i*22, 0.47, DIM_C)
+
+def draw_win_popup(canvas, t, solve_time):
     h, w = canvas.shape[:2]
-    # Dark vignette
-    overlay = canvas.copy()
-    cv2.rectangle(overlay, (0, 0), (w, h), (10, 12, 18), -1)
-    cv2.addWeighted(overlay, 0.55, canvas, 0.45, 0, canvas)
+    ov = canvas.copy()
+    cv2.rectangle(ov, (0,0), (w,h), (8,10,16), -1)
+    cv2.addWeighted(ov, 0.58, canvas, 0.42, 0, canvas)
 
-    pulse  = 0.5 + 0.5 * math.sin(t * 3)
-    scale  = 1.0 + 0.03 * math.sin(t * 2.5)
+    pulse = 0.5 + 0.5*math.sin(t*3)
+    scale = 1.0 + 0.025*math.sin(t*2.5)
+    fade  = min(1.0, t*2.8)
 
-    # Popup card
-    card_w, card_h = 520, 230
-    cx = w // 2
-    cy = h // 2
-    cx1 = cx - card_w // 2
-    cy1 = cy - card_h // 2
-    alpha_card = min(1.0, t * 3)
-    draw_rounded_rect(canvas, cx1, cy1, card_w, card_h, 28,
-                      (20, 24, 32), -1, alpha=alpha_card * 0.92)
-    border_col = tuple(int(c * (0.6 + 0.4 * pulse)) for c in WIN_COLOR)
-    draw_rounded_rect(canvas, cx1, cy1, card_w, card_h, 28,
-                      border_col, thickness=3, alpha=alpha_card)
+    cw, ch2 = 560, 250
+    cx, cy = w//2, h//2
+    rrect(canvas, cx-cw//2, cy-ch2//2, cw, ch2, 28, (18,22,30), -1, alpha=fade*0.94)
+    bc = tuple(int(c*(0.5+0.5*pulse)) for c in WIN_C)
+    rrect(canvas, cx-cw//2, cy-ch2//2, cw, ch2, 28, bc, thick=3, alpha=fade)
 
-    put_text_centered(canvas, "PUZZLE  SOLVED!", cx, cy - 60,
-                      1.5 * scale, WIN_COLOR, 3)
+    ttext(canvas, "PUZZLE  SOLVED!", cx, cy-68, 1.5*scale, WIN_C, 3)
 
-    mins = int(solve_time) // 60
-    secs = int(solve_time) % 60
-    ms   = int((solve_time - int(solve_time)) * 100)
-    if mins > 0:
-        time_str = f"Time: {mins}m {secs:02d}.{ms:02d}s"
-    else:
-        time_str = f"Solved in  {secs}.{ms:02d}  seconds!"
-    put_text_centered(canvas, time_str, cx, cy + 10, 0.9, ACCENT2, 2)
-
-    put_text_centered(canvas, "Raise both hands to play again",
-                      cx, cy + 72, 0.55, TEXT_COLOR, 1)
+    mins = int(solve_time)//60
+    secs = int(solve_time)%60
+    ms   = int((solve_time-int(solve_time))*100)
+    ts   = (f"Time: {mins}m {secs:02d}.{ms:02d}s" if mins
+            else f"Solved in  {secs}.{ms:02d}  seconds!")
+    ttext(canvas, ts, cx, cy+12, 0.95, ACCENT2, 2)
+    ttext(canvas, "Raise both hands to play again", cx, cy+72, 0.54, TEXT_C)
 
 
-#  GESTURE CONTROLLER
-# ─────────────────────────────────────────────
- 
-class GestureController:
-    """Maps hand data → game actions with debouncing."""
- 
+# ── FPS Counter ────────────────────────────────
+
+class FPS:
+    def __init__(self, n=30):
+        self._t = []; self._n = n
+    def tick(self):
+        self._t.append(time.time())
+        self._t = self._t[-self._n:]
+        if len(self._t) < 2: return 0.0
+        span = self._t[-1] - self._t[0]
+        return (len(self._t)-1)/span if span else 0.0
+
+
+# ── Main App ───────────────────────────────────
+
+class App:
     def __init__(self):
-        self._pinch_held  = False
-        self._pinch_start = 0
-        self.PINCH_HOLD   = 0.12   # seconds to confirm pinch
- 
-    def get_cursor(self, hands):
-        """Primary cursor = right-hand index tip."""
-        for h in hands:
-            if h['label'] == 'Right':
-                return h['index_tip']
-        if hands:
-            return hands[-1]['index_tip']
-        return None
- 
-    def get_pinch(self, hands):
-        """Is any hand pinching right now?"""
-        for h in hands:
-            if h['label'] == 'Right' and h['is_pinching']:
-                return True, h['index_tip']
-        return False, None
- 
-    def get_frame_rect(self, hands, frame_shape):
-        """Return (x1,y1,x2,y2) rectangle between both hands, or None."""
-        if len(hands) < 2:
-            return None
-        h, w = frame_shape[:2]
-        pts = [h_['index_tip'] for h_ in hands]
-        x1 = min(pts[0][0], pts[1][0])
-        y1 = min(pts[0][1], pts[1][1])
-        x2 = max(pts[0][0], pts[1][0])
-        y2 = max(pts[0][1], pts[1][1])
-        min_size = 80
-        if (x2 - x1) < min_size or (y2 - y1) < min_size:
-            return None
-        return (x1, y1, x2, y2)
- 
-# ─────────────────────────────────────────────
-#  OVERLAY / UI RENDERER
-# ─────────────────────────────────────────────
- 
-def draw_frame_rect(canvas, rect, t):
-    """Draw an animated selection rectangle."""
-    x1, y1, x2, y2 = rect
-    pulse = 0.5 + 0.5 * math.sin(t * 4)
- 
-    # Glow layers
-    for i in range(4, 0, -1):
-        alpha = 0.05 * i * pulse
-        overlay = canvas.copy()
-        cv2.rectangle(overlay, (x1 - i*3, y1 - i*3), (x2 + i*3, y2 + i*3),
-                      GLOW_COLOR, 2)
-        cv2.addWeighted(overlay, alpha, canvas, 1 - alpha, 0, canvas)
- 
-    # Main border
-    color = tuple(int(c * (0.75 + 0.25 * pulse)) for c in ACCENT)
-    cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
- 
-    # Corner accents
-    length = 20
-    thick  = 3
-    for cx, cy, sx, sy in [(x1,y1,1,1),(x2,y1,-1,1),(x1,y2,1,-1),(x2,y2,-1,-1)]:
-        cv2.line(canvas, (cx, cy), (cx + sx*length, cy), ACCENT2, thick, cv2.LINE_AA)
-        cv2.line(canvas, (cx, cy), (cx, cy + sy*length), ACCENT2, thick, cv2.LINE_AA)
- 
-    # Centre label
-    cx_mid = (x1 + x2) // 2
-    cy_mid = (y1 + y2) // 2
-    put_text_centered(canvas, "PINCH TO CAPTURE", cx_mid, cy_mid,
-                      0.45, ACCENT, 1)
- 
-def draw_flash(canvas, alpha):
-    """White flash effect on capture."""
-    overlay = np.ones_like(canvas, dtype=np.uint8) * 255
-    cv2.addWeighted(overlay, alpha, canvas, 1 - alpha, 0, canvas)
- 
-def draw_hud(canvas, phase, fps, hands_count):
-    h, w = canvas.shape[:2]
- 
-    # FPS chip
-    fps_text = f"{int(fps)} fps"
-    draw_rounded_rect(canvas, w - 80, 12, 68, 26, 8, (30, 32, 42), -1)
-    cv2.putText(canvas, fps_text, (w - 72, 30), FONT, 0.45,
-                DIM_TEXT, 1, cv2.LINE_AA)
- 
-    # Phase indicator
-    phase_labels = {
-        'IDLE':     ('● IDLE',        DIM_TEXT),
-        'FRAMING':  ('◈ FRAMING',     ACCENT),
-        'CAPTURED': ('✦ PUZZLE READY',ACCENT2),
-        'PLAYING':  ('▶ PLAYING',     WIN_COLOR),
-        'SOLVED':   ('★ SOLVED',      WIN_COLOR),
-    }
-    label, color = phase_labels.get(phase, ('', TEXT_COLOR))
-    cv2.putText(canvas, label, (16, 34), FONT, 0.55, color, 1, cv2.LINE_AA)
- 
-    # Hand count dots
-    for i in range(2):
-        col = ACCENT if i < hands_count else (45, 48, 60)
-        cv2.circle(canvas, (16 + i * 18, 52), 5, col, -1, cv2.LINE_AA)
- 
-def draw_instructions(canvas, phase):
-    h, w = canvas.shape[:2]
-    lines = {
-        'IDLE':     ["Raise both hands", "to start framing"],
-        'FRAMING':  ["🤏 Pinch to capture"],
-        'CAPTURED': ["Puzzle loading…"],
-        'PLAYING':  ["☝️  Cursor  |  🤏 Pick & Drop"],
-        'SOLVED':   ["🎉 Puzzle Complete!"],
-    }
-    msgs = lines.get(phase, [])
-    y_base = h - 20 - len(msgs) * 24
-    for i, msg in enumerate(msgs):
-        put_text_centered(canvas, msg, w // 2, y_base + i * 24,
-                          0.50, DIM_TEXT, 1)
- 
-def draw_solved_overlay(canvas, t, solve_time=0.0):
-    h, w = canvas.shape[:2]
-    # Dark vignette
-    overlay = canvas.copy()
-    cv2.rectangle(overlay, (0, 0), (w, h), (10, 12, 18), -1)
-    cv2.addWeighted(overlay, 0.55, canvas, 0.45, 0, canvas)
-
-    pulse  = 0.5 + 0.5 * math.sin(t * 3)
-    scale  = 1.0 + 0.03 * math.sin(t * 2.5)
-
-    # Popup card
-    card_w, card_h = 520, 230
-    cx = w // 2
-    cy = h // 2
-    cx1 = cx - card_w // 2
-    cy1 = cy - card_h // 2
-    alpha_card = min(1.0, t * 3)
-    draw_rounded_rect(canvas, cx1, cy1, card_w, card_h, 28,
-                      (20, 24, 32), -1, alpha=alpha_card * 0.92)
-    border_col = tuple(int(c * (0.6 + 0.4 * pulse)) for c in WIN_COLOR)
-    draw_rounded_rect(canvas, cx1, cy1, card_w, card_h, 28,
-                      border_col, thickness=3, alpha=alpha_card)
-
-    put_text_centered(canvas, "PUZZLE  SOLVED!", cx, cy - 60,
-                      1.5 * scale, WIN_COLOR, 3)
-
-    mins = int(solve_time) // 60
-    secs = int(solve_time) % 60
-    ms   = int((solve_time - int(solve_time)) * 100)
-    if mins > 0:
-        time_str = f"Time: {mins}m {secs:02d}.{ms:02d}s"
-    else:
-        time_str = f"Solved in  {secs}.{ms:02d}  seconds!"
-    put_text_centered(canvas, time_str, cx, cy + 10, 0.9, ACCENT2, 2)
-
-    put_text_centered(canvas, "Raise both hands to play again",
-                      cx, cy + 72, 0.55, TEXT_COLOR, 1)
-
-#  MAIN APPLICATION
-# ─────────────────────────────────────────────
- 
-class GesturePuzzleApp:
-    def __init__(self):
-        self.cap     = cv2.VideoCapture(0)
+        self.cap = cv2.VideoCapture(0)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
- 
-        self.tracker    = HandTracker()
-        self.gesture    = GestureController()
-        self.puzzle     = None
-        self.phase      = 'IDLE'   # IDLE | FRAMING | CAPTURED | PLAYING | SOLVED
- 
-        self.frame_rect  = None
-        self.flash_alpha = 0.0
+
+        self.tracker     = HandTracker()
+        self.gesture     = Gesture()
+        self.fps         = FPS()
+        self.phase       = 'IDLE'
+        self.puzzle      = None
         self.t           = 0.0
-        self.fps_counter = FPSCounter()
- 
-        # Drag state
-        self.dragging_idx = None
-        self.drag_pos     = (0, 0)
-        self._pinch_was   = False
-        self._last_frame_rect = None
- 
-        # Solved animation
-        self._solved_t    = 0.0
-        self._play_start  = 0.0   # when PLAYING phase begins
-        self._solve_time  = 0.0   # seconds taken to solve
- 
+        self._frame_rect = None
+        self._last_fr    = None
+        self._flash      = 0.0
+        self._pinch_prev = False
+        self._play_start = 0.0
+        self._solve_time = 0.0
+        self._solved_t   = 0.0
+        self._cap_start  = 0.0
+
     def run(self):
-        print("🎮  Gesture Puzzle started. Press Q to quit.")
-        prev_time = time.time()
- 
+        prev = time.time()
         while True:
-            ret, raw_frame = self.cap.read()
-            if not ret:
-                break
- 
-            raw_frame = cv2.flip(raw_frame, 1)
-            now  = time.time()
-            dt   = now - prev_time
-            prev_time = now
+            ok, raw = self.cap.read()
+            if not ok: break
+            raw = cv2.flip(raw, 1)
+            now = time.time()
+            dt  = now - prev; prev = now
             self.t += dt
-            fps = self.fps_counter.tick()
- 
-            # ── Hand tracking ────────────────────────────────
-            rgb    = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2RGB)
-            fshape = raw_frame.shape
-            hands  = self.tracker.process(rgb, fshape)
- 
-            # ── Build canvas ─────────────────────────────────
-            if self.phase in ('PLAYING', 'SOLVED', 'CAPTURED'):
-                # Dark panel background
-                canvas = np.full(raw_frame.shape, BG, dtype=np.uint8)
-                # Small camera preview top-right
-                ph, pw = raw_frame.shape[:2]
-                prev_w, prev_h = 260, 146
-                small = cv2.resize(raw_frame, (prev_w, prev_h))
-                px = pw - prev_w - 20
-                py = 70
-                draw_rounded_rect(canvas, px - 3, py - 3, prev_w + 6, prev_h + 6,
-                                  10, TILE_BORDER, -1)
-                canvas[py:py+prev_h, px:px+prev_w] = small
-                self.tracker.draw_landmarks(canvas[py:py+prev_h, px:px+prev_w], hands)
-            else:
-                canvas = raw_frame.copy()
-                # Slight dark overlay for readability
-                dark = np.zeros_like(canvas)
-                cv2.addWeighted(dark, 0.3, canvas, 0.7, 0, canvas)
- 
-            # ── State machine ─────────────────────────────────
-            if self.phase == 'IDLE':
-                self._update_idle(canvas, hands, fshape)
- 
-            elif self.phase == 'FRAMING':
-                self._update_framing(canvas, hands, fshape, raw_frame)
- 
-            elif self.phase == 'CAPTURED':
-                self._update_captured(canvas, dt)
- 
-            elif self.phase == 'PLAYING':
-                self._update_playing(canvas, hands, dt)
- 
-            elif self.phase == 'SOLVED':
-                self._update_solved(canvas, hands, dt)
- 
-            # ── Hand landmarks (camera view phases) ──────────
-            if self.phase in ('IDLE', 'FRAMING'):
-                self.tracker.draw_landmarks(canvas, hands)
- 
-            # ── Flash effect ──────────────────────────────────
-            if self.flash_alpha > 0:
-                draw_flash(canvas, self.flash_alpha)
-                self.flash_alpha = max(0.0, self.flash_alpha - dt * 3.5)
- 
-            # ── HUD ───────────────────────────────────────────
+            fps = self.fps.tick()
+
+            rgb   = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
+            hands = self.tracker.process(rgb, raw.shape)
+
+            # Canvas = camera feed always (puzzle overlaid on it)
+            canvas = raw.copy()
+
+            if   self.phase == 'IDLE':     self._idle(canvas, hands)
+            elif self.phase == 'FRAMING':  self._framing(canvas, hands, raw)
+            elif self.phase == 'CAPTURED': self._captured(canvas, hands, dt)
+            elif self.phase == 'PLAYING':  self._playing(canvas, hands, dt)
+            elif self.phase == 'SOLVED':   self._solved_phase(canvas, hands, dt)
+
+            self.tracker.draw(canvas, hands)
+
+            if self._flash > 0:
+                ov = np.ones_like(canvas, dtype=np.uint8)*255
+                cv2.addWeighted(ov, self._flash, canvas, 1-self._flash, 0, canvas)
+                self._flash = max(0.0, self._flash - dt*3.5)
+
             draw_hud(canvas, self.phase, fps, len(hands))
             draw_instructions(canvas, self.phase)
- 
-            cv2.imshow("✦ Gesture Puzzle", canvas)
+
+            cv2.imshow("Gesture Puzzle", canvas)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
- 
         self.cap.release()
         cv2.destroyAllWindows()
- 
-    # ── Phase handlers ────────────────────────────────────────
- 
-    def _update_idle(self, canvas, hands, fshape):
+
+    def _idle(self, canvas, hands):
         if len(hands) >= 2:
             self.phase = 'FRAMING'
- 
-    def _update_framing(self, canvas, hands, fshape, raw_frame):
+
+    def _framing(self, canvas, hands, raw):
         if len(hands) < 2:
-            self.phase = 'IDLE'
-            self.frame_rect = None
-            return
- 
-        rect = self.gesture.get_frame_rect(hands, fshape)
+            self.phase = 'IDLE'; self._frame_rect = None; return
+        rect = self.gesture.frame_rect(hands, raw.shape)
         if rect:
-            # Smooth rect transition
-            if self._last_frame_rect is None:
-                self._last_frame_rect = rect
+            if self._last_fr is None:
+                self._last_fr = rect
             else:
-                lr = self._last_frame_rect
-                self._last_frame_rect = (
-                    int(lerp(lr[0], rect[0], 0.3)),
-                    int(lerp(lr[1], rect[1], 0.3)),
-                    int(lerp(lr[2], rect[2], 0.3)),
-                    int(lerp(lr[3], rect[3], 0.3)),
+                lr = self._last_fr
+                self._last_fr = (
+                    int(lerp(lr[0], rect[0], 0.22)),
+                    int(lerp(lr[1], rect[1], 0.22)),
+                    int(lerp(lr[2], rect[2], 0.22)),
+                    int(lerp(lr[3], rect[3], 0.22)),
                 )
-            self.frame_rect = self._last_frame_rect
-            draw_frame_rect(canvas, self.frame_rect, self.t)
- 
-            # Check pinch to capture
-            is_pinching, _ = self.gesture.get_pinch(hands)
-            if is_pinching and self.frame_rect:
-                self._capture_region(raw_frame, self.frame_rect)
- 
-    def _capture_region(self, raw_frame, rect):
+            self._frame_rect = self._last_fr
+            draw_frame_ui(canvas, self._frame_rect, self.t)
+            pinching, _ = self.gesture.pinch(hands)
+            if pinching and self._frame_rect:
+                self._capture(raw, self._frame_rect)
+
+    def _capture(self, raw, rect):
         x1, y1, x2, y2 = rect
-        h, w = raw_frame.shape[:2]
+        H, W = raw.shape[:2]
         x1 = max(0, x1); y1 = max(0, y1)
-        x2 = min(w, x2); y2 = min(h, y2)
-        if x2 - x1 < 60 or y2 - y1 < 60:
+        x2 = min(W, x2); y2 = min(H, y2)
+        if x2-x1 < 60 or y2-y1 < 60:
             return
-        cropped = raw_frame[y1:y2, x1:x2]
-        side    = min(x2-x1, y2-y1)
-        square  = cv2.resize(cropped, (side, side))
-        fh, fw = raw_frame.shape[:2]
-        self.puzzle     = Puzzle(square, grid=GRID, canvas_size=(fw, fh))
-        self.flash_alpha = 0.9
+        crop = raw[y1:y2, x1:x2]
+
+        # Make puzzle square using shorter side, centred on frame
+        side = min(x2-x1, y2-y1)
+        cx   = (x1+x2)//2
+        cy   = (y1+y2)//2
+        fr   = (cx-side//2, cy-side//2, cx+side//2, cy+side//2)
+
+        square = cv2.resize(crop, (side, side))
+        self.puzzle      = Puzzle(square, fr)
+        self._flash      = 0.80
+        self._cap_start  = time.time()
         self.phase       = 'CAPTURED'
-        self._captured_start = time.time()
- 
-    def _update_captured(self, canvas, dt):
+        self._pinch_prev = False
+
+    def _captured(self, canvas, hands, dt):
         if self.puzzle:
             self.puzzle.update(dt)
             self.puzzle.draw(canvas)
-            # Auto-advance to PLAYING after brief pause
-            if time.time() - self._captured_start > 1.5:
-                self.phase = 'PLAYING'
-                self._play_start = time.time()
- 
-    def _update_playing(self, canvas, hands, dt):
-        if not self.puzzle:
-            return
+        if time.time() - self._cap_start > 1.5:
+            self.phase       = 'PLAYING'
+            self._play_start = time.time()
+
+    def _playing(self, canvas, hands, dt):
+        if not self.puzzle: return
         self.puzzle.update(dt)
- 
-        cursor = self.gesture.get_cursor(hands)
-        is_pinching, pinch_pos = self.gesture.get_pinch(hands)
- 
-        hover = None
-        if cursor:
-            hover = self.puzzle.tile_at_pixel(*cursor)
- 
-        # Pinch down - pick tile
-        if is_pinching and not self._pinch_was:
+
+        cursor   = self.gesture.cursor(hands)
+        pinching, _ = self.gesture.pinch(hands)
+
+        if pinching and not self._pinch_prev:
             if cursor:
-                pick = self.puzzle.tile_at_pixel(*cursor)
-                if pick is not None and self.puzzle.tiles[pick]['img'] is not None:
-                    self.dragging_idx = pick
-                    self.drag_pos = cursor
+                ti = self.puzzle.tile_at(*cursor)
+                if ti is not None:
+                    self.puzzle.start_drag(ti, *cursor)
+        elif pinching and self._pinch_prev:
+            if cursor and self.puzzle.drag_idx is not None:
+                self.puzzle.update_drag(*cursor)
+        elif not pinching and self._pinch_prev:
+            if cursor:
+                self.puzzle.drop(*cursor)
 
-        elif is_pinching and self._pinch_was:
-            # Continue drag
-            if self.dragging_idx is not None and cursor:
-                self.drag_pos = cursor
+        self._pinch_prev = pinching
+        self.puzzle.draw(canvas)
 
-        elif not is_pinching and self._pinch_was:
-            # Release - swap with nearest slot
-            if self.dragging_idx is not None and cursor:
-                target_slot = self.puzzle.nearest_slot(*cursor)
-                if target_slot is not None and target_slot != self.dragging_idx:
-                    self.puzzle.swap_with(self.dragging_idx, target_slot)
-                self.dragging_idx = None
-
-        self._pinch_was = is_pinching
- 
-        # Draw puzzle
-        drop_tgt = None
-        if self.dragging_idx is not None and cursor:
-            drop_tgt = self.puzzle.nearest_slot(*cursor)
-        self.puzzle.draw(canvas, hover_tile=hover,
-                         drag_idx=self.dragging_idx,
-                         drag_pos=self.drag_pos if self.dragging_idx is not None else None,
-                         drop_target=drop_tgt)
- 
-        # Draw elapsed timer top-center
-        elapsed = time.time() - self._play_start
-        mins_e = int(elapsed) // 60
-        secs_e = int(elapsed) % 60
-        timer_str = f"{mins_e}:{secs_e:02d}" if mins_e > 0 else f"{secs_e}s"
-        ch, cw = canvas.shape[:2]
-        put_text_centered(canvas, timer_str, cw // 2, 32, 0.8, ACCENT, 2)
-
-        # Draw cursor
         if cursor:
-            color = ACCENT2 if is_pinching else ACCENT
-            glow_circle(canvas, cursor[0], cursor[1], 8, color, layers=3)
-            if is_pinching:
-                cv2.circle(canvas, cursor, 14, ACCENT2, 1, cv2.LINE_AA)
- 
-        # Check win
+            col = ACCENT2 if pinching else ACCENT
+            glow_dot(canvas, cursor[0], cursor[1], 8, col, 3)
+            if pinching:
+                cv2.circle(canvas, cursor, 15, ACCENT2, 1, cv2.LINE_AA)
+
+        # Live timer top-center
+        elapsed = time.time() - self._play_start
+        m, s = int(elapsed)//60, int(elapsed)%60
+        ts = f"{m}:{s:02d}" if m else f"{s}s"
+        h2, w2 = canvas.shape[:2]
+        ttext(canvas, ts, w2//2, 30, 0.85, ACCENT, 2)
+
         if self.puzzle.is_solved():
-            self.phase      = 'SOLVED'
-            self._solved_t  = 0.0
             self._solve_time = time.time() - self._play_start
-            # Final draw with completed puzzle
-            self.puzzle.draw(canvas)
- 
-    def _update_solved(self, canvas, hands, dt):
+            self.phase       = 'SOLVED'
+            self._solved_t   = 0.0
+
+    def _solved_phase(self, canvas, hands, dt):
         self._solved_t += dt
         if self.puzzle:
             self.puzzle.update(dt)
             self.puzzle.draw(canvas)
-        draw_solved_overlay(canvas, self._solved_t, self._solve_time)
-        # Restart on two-hand raise
+        draw_win_popup(canvas, self._solved_t, self._solve_time)
         if len(hands) >= 2:
-            self.phase   = 'IDLE'
-            self.puzzle  = None
-            self.frame_rect = None
-            self._last_frame_rect = None
- 
- 
-# ─────────────────────────────────────────────
-#  FPS COUNTER
-# ─────────────────────────────────────────────
- 
-class FPSCounter:
-    def __init__(self, window=30):
-        self._times  = []
-        self._window = window
- 
-    def tick(self):
-        self._times.append(time.time())
-        self._times = self._times[-self._window:]
-        if len(self._times) < 2:
-            return 0.0
-        span = self._times[-1] - self._times[0]
-        return (len(self._times) - 1) / span if span > 0 else 0.0
- 
- 
-# ─────────────────────────────────────────────
-#  ENTRY POINT
-# ─────────────────────────────────────────────
- 
+            self.phase = 'IDLE'
+            self.puzzle = None
+            self._frame_rect = None
+            self._last_fr    = None
+
+
+# ── Entry ──────────────────────────────────────
+
 if __name__ == "__main__":
     print("""
-╔══════════════════════════════════════════════╗
-║           ✦  GESTURE PUZZLE  ✦               ║
-║                                              ║
-║  ✌️  Both hands  → Frame a region            ║
-║  🤏  Pinch       → Capture & start puzzle    ║
-║  ☝️  Index       → Cursor                    ║
-║  🤏  Pinch tile  → Slide it                  ║
-║  Q              → Quit                       ║
-╚══════════════════════════════════════════════╝
++------------------------------------------+
+|          GESTURE PUZZLE                  |
+|                                          |
+|  Both hands  -> Frame a region           |
+|  Pinch       -> Capture puzzle           |
+|  Pinch tile  -> Pick up                  |
+|  Drag + drop -> Swap with another tile   |
+|  Q           -> Quit                     |
++------------------------------------------+
 """)
-    app = GesturePuzzleApp()
-    app.run()
+    App().run()
